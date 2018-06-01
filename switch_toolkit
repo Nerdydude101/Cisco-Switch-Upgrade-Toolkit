@@ -1,0 +1,533 @@
+#!/bin/bash
+
+#============================
+#          Variables
+#============================
+opticPort=0
+opticPortNum=49
+declare -a opticArray
+opticHolder=""
+isOptic=0
+endOfPorts=0
+
+switches24=""
+switches48=""
+primarySwitch=0
+secondarySwitch=0
+
+fileName=""
+
+
+#==========================
+#       Functions
+#==========================
+
+#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+# This function creates a data file of all the ports available
+#  to determine which switches are 24 port and which switches
+#  are 48 port
+#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+function get_Default_Prime_Second(){
+  cat $1 | grep -Po 'interface.*[0-9]+\/[0-9]+\/[0-9]+' >> allPorts
+  #------------------------------------------------------
+  # Seperate the switch numbers into the respective lists
+  #-------------------------------------------------------
+  for f in $(tac allPorts)
+  do
+    if [[ $f =~ "48" ]]
+    then
+      temp=$(echo "$f" | grep -Po 't[0-9]+' | grep -Po '[0-9]+')
+      switches48="$switches48,$temp"
+      continue
+    elif [[ $f =~ "24" ]] && [[ $switches48 != *"$(echo "$f" | grep -Po 't[0-9]+' | grep -Po '[0-9]+')"* ]]
+    then
+      temp=$(echo "$f" | grep -Po 't[0-9]+' | grep -Po '[0-9]+')
+      switches24="$switches24,$temp"
+    fi
+  done
+  #---------------------------
+  #remove temporary data file
+  #---------------------------
+  rm allPorts
+  #------------------------------------------
+  #reverse switch lists for final formatting
+  #------------------------------------------
+  switches48=$(echo "$switches48" | rev)
+  switches24=$(echo "$switches24" | rev)
+
+  #----------------------------------------------------------------------
+  # set primary and secondary switches as the first two 24 port switches
+  #----------------------------------------------------------------------
+  primarySwitch=$(echo "$switches24" | awk -F ',' '{print $1}')
+  secondarySwitch=$(echo "$switches24" | awk -F ',' '{print $2}')
+
+}
+
+#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+# This function takes two 24 port switches and alters the
+#  config to make them a single 48 port switch
+#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+function combine_switches(){
+cat $1 | while IFS= read l
+do
+
+#  echo "input: $l"
+
+#--------------------------------------------
+# Determine if current port is an optic port
+#--------------------------------------------
+
+  if [[ $l =~ .*[$primarySwitch-$secondarySwitch]/0/(25|26|27|28).* ]]
+  then
+    isOptic=1
+  fi
+
+#---------------------------------------------------------
+# If a port is an optic port, store it's config for later
+#---------------------------------------------------------
+
+  if [ $isOptic == 1 ]
+  then
+    opticHolder="$opticHolder$l"$'\n'
+    if [ "$l" != "!" ]
+    then
+      continue
+    fi
+    opticArray[$opticPort]="$opticHolder"
+
+
+    opticPort=$(echo $opticPort+1 | bc)
+    isOptic=0
+
+
+    opticHolder=""
+    continue
+  fi
+
+#-----------------------------------
+# Alter 24-port to 48-port standard
+#-----------------------------------
+
+  if [[ $l =~ .*"$secondarySwitch"/.* ]]
+  then
+    portNum=$(echo $l | grep -Po "$secondarySwitch/0/(.{1,2})" | sed -r "s/$secondarySwitch\//$primarySwitch\//g" | sed -r "s/$primarySwitch\/0\/(.{1,2})/\1/g")
+    newNum=$(echo $portNum+24 | bc)
+
+
+    l=$(echo $l | sed -r "s/$secondarySwitch\//$primarySwitch\//g" | sed -r "s/$primarySwitch\/0\/(.{1,2})/$primarySwitch\/0\/$newNum/g")
+  fi
+
+  echo "$l" >> new.config
+
+#--------------------------------------------------------------------
+# If it's the end of the port configs, insert the optic port configs
+#--------------------------------------------------------------------
+  if [[ $l =~ .*["$primarySwitch"|"$secondarySwitch"]/0/48 ]]
+  then
+    endOfPorts=1
+  fi
+  if [[ $l == "!" ]] && [[ $endOfPorts == 1 ]]
+  then
+    temp=${#opticArray[@]}
+    for ((j=0;j<temp;j++))
+    do
+
+      #--------------------------------------------------------
+      # This is so the for-loop subshell doesn't ignore the \n
+      #--------------------------------------------------------
+
+      IFS=
+      i="${opticArray[$j]}"
+
+      #-------------------------------------------------------------
+      # If the config for that optic port is empty, don't insert it
+      #-------------------------------------------------------------
+
+      if [[ $i =~ .*["$primarySwitch"|"$secondarySwitch"]\/0\/([0-9]{1,2})($'\n')! ]]
+      then
+        continue
+      fi
+      i=$(echo $i | sed -r "s/(.*[$primarySwitch|$secondarySwitch]\/0\/)([0-9]{1,2})(.*)/\1$opticPortNum\3/g")
+
+      echo "$i" >> new.config
+
+      opticPortNum=$(echo "$opticPortNum+1" | bc)
+    done
+
+    #-------------------------------------------------------------------
+    # If the script hasn't added all 2 optic ports, add some blank ones
+    #-------------------------------------------------------------------
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    # redundant?
+    #!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    while [[ $opticPortNum -lt 50 ]]
+    do
+      echo "interface GigabitEthernet$primarySwitch/0/$opticPortNum" >> new.config
+      opticPortNum=$(echo "opticPortNum+1" | bc)
+      echo "!" >> new.config
+    done
+    endOfPorts=0
+  fi
+done
+
+}
+
+#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+# This function takes two switches (either 24 or 48) and tries
+#  to merge them into just one switch of switch type primarySwitch
+#$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# 3rd optional argument to specify
+#  final switch type?
+#!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+function merge_switches(){
+  toggle=0
+  cat $1 | while IFS= read l
+  do
+    IFS=
+    #----------------------------------------------------------
+    # Make a data file containing all the ports of each switch
+    #----------------------------------------------------------
+    if [[ $l =~ "$primarySwitch/0/" ]] || [[ "$toggle" == "1" ]]
+    then
+      toggle=1
+      echo "$l" >> primary
+      if [[ "$l" == "!" ]]
+      then
+        toggle=0
+        continue
+      fi
+      continue
+    fi
+
+    if [[ $l =~ "$secondarySwitch/0/" ]] || [[ "$toggle" == "2" ]]
+    then
+      toggle=2
+      echo "$l" >> secondary
+      if [[ "$l" == "!" ]]
+      then
+        toggle=0
+        continue
+      fi
+      continue
+    fi
+  done
+  #----------------------------
+  # put fiber in seperate file
+  #----------------------------
+  case  $(cat primary | grep $primarySwitch/0 | wc -l) in
+    28)
+      toggle=0
+      cat primary | while IFS= read l
+      do
+        if [[ $l =~ "$primarySwitch"\/0\/(25|26|27|28) ]] || [[ $toggle == 1 ]]
+        then
+          toggle=1
+          echo "$l" >> fiber
+          head -n -1 primary >> tmp; mv tmp primary
+          if [[ "$l" == "!" ]]
+          then
+            toggle=0
+          fi
+        fi
+      done
+    ;;
+    50)
+      toggle=0
+      cat primary | while IFS= read l
+      do
+        if [[ $l =~ "$primarySwitch"\/0\/(49|50) ]] || [[ $toggle == 1 ]]
+        then
+          toggle=1
+          echo $l >> fiber
+          head -n -1 primary >> tmp; mv tmp primary
+          if [[ "$l" == "!" ]]
+          then
+            toggle=0
+          fi
+        fi
+      done
+    ;;
+  esac
+  case $(cat secondary | grep $secondarySwitch/0 | wc -l) in
+    28)
+      toggle=0
+      cat secondary | while IFS= read l
+      do
+        if [[ $l =~ "$secondarySwitch"\/0\/(25|26|27|28) ]] || [[ $toggle == 1 ]]
+        then
+          toggle=1
+          echo $l >> fiber
+          head -n -1 secondary >> tmp; mv tmp secondary
+          if [[ "$l" == "!" ]]
+          then
+            toggle=0
+          fi
+        fi
+      done
+    ;;
+    50)
+      toggle=0
+      cat primary | while IFS= read l
+      do
+        if [[ $l =~ "$secondarySwitch"\/0\/(49|50) ]] || [[ $toggle == 1 ]]
+        then
+          toggle=1
+          echo $l >> fiber
+          head -n -1 secondary >> tmp; mv tmp secondary
+          if [[ "$l" == "!" ]]
+          then
+            toggle=0
+          fi
+        fi
+      done
+    ;;
+  esac
+  #----------------------------------------------
+  # Compare the config lists for first placement
+  #----------------------------------------------
+  counter=1
+  currentPrim=""
+  currentSec=""
+
+  tmp=$(cat primary | grep "!" | wc -l)
+  if [[ tmp -lt $(cat secondary | grep "!" | wc -l) ]]
+  then
+    tmp=$(cat secondary | grep "!" | wc -l)
+  fi
+
+  #---------------------------------------------------------
+  #If there is no confliction then just keep ports the same
+  #---------------------------------------------------------
+  for((i=1;i<=tmp;i++))
+  do
+    currentPrim=$(cat primary | tr '\n' '~' | grep -Po "interface[a-zA-Z]*\s[a-zA-Z]*$primarySwitch\/0\/$i~([^!])*!{1}" | tr '~' '\n')
+    currentSec=$(cat secondary | tr '\n' '~' | grep -Po "interface[a-zA-Z]*\s[a-zA-Z]*$secondarySwitch\/0\/$i~([^!])*!{1}" | tr '~' '\n')
+
+    #-----------------------------------------
+    # If currentSec is empty, use currentPrim
+    #-----------------------------------------
+    if [[ "$currentPrim" != "$currentSec" && ("$currentSec" == "" || "$currentSec" =~ interface.*"$secondarySwitch"\/0\/"$i"$'\n'! || "$currentSec" =~ "shut") ]]
+    then
+      echo "$currentPrim" >> newConfPlaceholder
+
+      #-----------------------------------------------
+      # if the non-used port is empty, don't queue it
+      #-----------------------------------------------
+      if [[ ! "$currentSec" =~ interface.*"$secondarySwitch"\/0\/"$i"$'\n'! ]]
+      then
+        echo "$currentSec" | sed "s/$secondarySwitch\//$primarySwitch\//g">> confQueue
+      fi
+    elif [[ "$currentPrim" != "$currentSec" && ("$currentPrim" == "" || "$currentPrim" =~ interface.*"$primarySwitch"\/0\/"$i"$'\n'! || "$currentPrim" =~ "shut") ]]
+    then
+      echo "$currentSec" | sed "s/$secondarySwitch\//$primarySwitch\//g">> newConfPlaceholder
+
+      #----------------------------------------------
+      #if the non-used port is empty, don't queue it
+      #----------------------------------------------
+      if [[ ! "$currentPrim" =~ interface.*"$primarySwitch"\/0\/"$i"$'\n'! ]]
+      then
+        echo "$currentPrim" >> confQueue
+      fi
+    #---------------------------------------------------------------
+    # If neither of these catch, there is a confliction.  Add first
+    #  switch's port and queue the second switch port
+    #---------------------------------------------------------------
+    else
+      echo "$currentPrim" >> newConfPlaceholder
+      echo "$currentSec" | sed "s/$secondarySwitch\//$primarySwitch\//g">> confQueue
+    fi
+  done
+
+  #------------------------------------------------------------
+  # Insert Queued ports into empty slots of newConfPlaceholder
+  #------------------------------------------------------------
+  currentQueueItem=$(cat confQueue | tr '\n' '~' | grep -Po '^.+?(?=!).{2}' | tr '~' '\n')
+
+  for((i=1;i<=tmp;i++))
+  do
+    currentPlaceholder=$(cat newConfPlaceholder | tr '\n' '~' | grep -Po '^.+?(?=!).{2}' | tr '~' '\n')
+    toRemove=$(echo "$currentPlaceholder" | wc -l)
+    tail -n +$((toRemove + 1)) newConfPlaceholder >> newConfPlaceholder.tmp
+    mv newConfPlaceholder.tmp newConfPlaceholder
+    if [[ "$currentPlaceholder" =~ interface.+?[0-9]+\/[0-9]\/[0-9]+$'\n'! && "$currentQueueItem" != "" ]]
+    then
+      #------------------------------------------------------------
+      # Set the queued item's interface line to the interface line
+      #  the new port
+      #------------------------------------------------------------
+      newIntLine=$(echo "$currentPlaceholder" | grep -Po interface.+?[0-9]+\/[0-9]+\/[0-9]+)
+      currentQueueItem=$(echo "$currentQueueItem" | sed -r "s#interface.+?[0-9]+/[0-9]+/[0-9]+#$newIntLine#g")
+      #----------------------------------------------------
+      # make the placeholder the item waiting in the queue
+      #----------------------------------------------------
+      currentPlaceholder="$currentQueueItem"
+      #-----------------------------------
+      # officially remove item from queue
+      #-----------------------------------
+      toRemove=$(echo "$currentQueueItem" | wc -l)
+      tail -n +$toRemove confQueue >> confQueue.tmp; mv confQueue.tmp confQueue
+      #-------------------
+      # advance the queue
+      #-------------------
+      currentQueueItem=$(cat confQueue | tr '\n' '~' | grep -Po '^.+?(?=!).{2}' | tr '~' '\n')
+    fi
+    #-------------------------------------------
+    # add item back into the newConfPlaceholder
+    #-------------------------------------------
+    echo "$currentPlaceholder" >> newConfPlaceholder
+  done
+
+  #-----------------------
+  # Re-insert fiber ports
+  #-----------------------
+  case $tmp in
+    24)
+      for((i=1;i<5;i++))
+      do
+        currentFiber=$(cat fiber | tr '\n' '~' | grep -Po '^.+?(?=!).{2}' | tr '~' '\n')
+        if [[ ! "$currentFiber" =~ interface.+?[0-9]+\/[0-9]+\/[0-9]+$'\n'! ]]
+        then
+          newNum=$(( tmp + i ))
+          currentFiber=$(echo "$currentFiber" | sed -r "s#(interface.+?[0-9]+/[0-9]+/)[0-9]+#\1$newNum#g")
+          echo "$currentFiber" >> newConfPlaceholder
+        fi
+        toRemove=$(echo "$currentFiber" | wc -l)
+        tail -n +$toRemove fiber >> fiber.tmp; mv fiber.tmp fiber
+      done
+    ;;
+    48)
+      for((i=1;i<5;i++))
+      do
+        currentFiber=$(cat fiber | tr '\n' '~' | grep -Po '^.+?(?=!).{2}' | tr '~' '\n')
+        if [[ ! "$currentFiber" =~ interface.+?[0-9]+\/[0-9]+\/[0-9]+$'\n'! ]]
+        then
+          newNum=$(( tmp + i ))
+          currentFiber=$(echo "$currentFiber" | sed -r "s#(interface.+?[0-9]+/[0-9]+/)[0-9]+#\1$newNum#g")
+          echo "$currentFiber" >> newConfPlaceholder
+        fi
+        toRemove=$(echo "$currentFiber" | wc -l)
+        tail -n +$toRemove fiber >> fiber.tmp; mv fiber.tmp fiber
+      done
+    ;;
+  esac
+
+  #---------------------------------------------------------
+  # switch the old port configs out for the new ones
+  #  replace primary switch's config with new merged config
+  #---------------------------------------------------------
+  case $(cat primary | grep $primarySwitch/0 | wc -l) in
+    24)
+      cat $fileName > new.config
+      switchText="$(cat newConfPlaceholder | tr '\n' '~')"
+      inputText=$(cat new.config | tr '\n' '~')
+      echo "$inputText" | sed -r "s#interface[^~]+$primarySwitch\/0\/1~.+$primarySwitch\/0\/28~!~#$switchText#g" | tr '~' '\n' >> new.config.tmp
+      mv new.config.tmp new.config
+    ;;
+    48)
+      cat $fileName > new.config
+      switchText="$(cat newConfPlaceholder | tr '\n' '~')"
+      inputText=$(cat new.config | tr '\n' '~')
+      echo "$inputText" | sed -r "s#interface[^~]+$primarySwitch\/0\/1~.+$primarySwitch\/0\/50~!~#$switchText#g" | tr '~' '\n' >> new.config.tmp
+      mv new.config.tmp new.config
+    ;;
+  esac
+  #--------------------------------------------------------------------------
+  # erase secondary switch's config since it is now a part of primary switch
+  #--------------------------------------------------------------------------
+  case $(cat secondary | grep $secondarySwitch/0 | wc -l) in
+    24)
+      switchText="!"
+      inputText=$(cat new.config | tr '\n' '~')
+      echo "$inputText" | sed -r "s#interface[^~]+$secondarySwitch\/0\/1~.+$secondarySwitch\/0\/28~!~#$switchText#g" | tr '~' '\n' >> new.config.tmp
+      mv new.config.tmp new.config
+    ;;
+    48)
+      switchText="!"
+      inputText=$(cat new.config | tr '\n' '~')
+      echo "$inputText" | sed -r "s#interface[^~]+$secondarySwitch\/0\/1~.+$secondarySwitch\/0\/50~!~#$switchText#g" | tr '~' '\n' >> new.config.tmp
+      mv new.config.tmp new.config
+    ;;
+  esac
+
+  #-----------------------------------
+  # Clean up the temporary data files
+  #-----------------------------------
+  rm fiber; rm primary; rm secondary; rm newConfPlaceholder; rm confQueue;
+
+}
+
+#===========================
+#     Get input file
+#===========================
+fileName=$1
+shift
+
+
+#===========================
+#     Option Handling
+#===========================
+while true
+do
+  case $1 in
+    #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    # combine - this flag takes 2 24-port switches and makes them into 1 48-port switch.  If no switch numbers are profivided
+    #  then it will default to the first two lowest numbered 24-port switches
+    # Usage:
+    #   ./script -c primary_switch (default lowest numbered 24-port) secondary switch (default second lowest numbered 24-port)
+    #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    -c)
+      shift
+      case $1 in
+        #-------------------------------------------------------------------
+        # if the next option is invalid (doesn't have a number or is empty)
+        #  then default to the first two 24 port switches
+        #-------------------------------------------------------------------
+        *[!0-9]* | "")
+          get_Default_Prime_Second $fileName
+        ;;
+        *)
+          primarySwitch=$1
+          shift
+          secondarySwitch=$1
+          ;;
+      esac
+      combine_switches $fileName
+    ;;
+    #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    # merge - this flag takes 2 switches of any kind and tries to fit
+    #  them both into 1 switch of the same size as the first switch
+    #  input
+    # Usage:
+    #    ./script -m primary_switch secondary_switch
+    #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+    -m)
+      shift
+      case $1 in
+        #-----------------------------------------------
+        #If the user did not input two numbers it exits
+        #-----------------------------------------------
+        *[!0-9]+ | "")
+          exit 128
+          ;;
+        *)
+          primarySwitch=$1
+          shift
+          case $1 in
+            *[!0-9]+ | "")
+              exit 128
+            ;;
+            *)
+              secondarySwitch=$1
+            ;;
+          esac
+        ;;  
+      esac
+      merge_switches $fileName
+    ;;
+    *)
+      break;;
+  esac
+done
+
+
