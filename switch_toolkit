@@ -474,7 +474,7 @@ do
     # combine - this flag takes 2 24-port switches and makes them into 1 48-port switch.  If no switch numbers are profivided
     #  then it will default to the first two lowest numbered 24-port switches
     # Usage:
-    #   ./script -c primary_switch (default lowest numbered 24-port) secondary switch (default second lowest numbered 24-port)
+    #   ./script input_config_file -c primary_switch (default lowest numbered 24-port) secondary switch (default second lowest numbered 24-port)
     #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
     -c)
       shift
@@ -499,7 +499,7 @@ do
     #  them both into 1 switch of the same size as the first switch
     #  input
     # Usage:
-    #    ./script -m primary_switch secondary_switch
+    #    ./script input_config_file -m primary_switch secondary_switch
     #@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
     -m)
       shift
